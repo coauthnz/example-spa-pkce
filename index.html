@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <title>Document</title>
+    <link rel="icon"
+          href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22><text y=%2226%22 font-size=%2232%22>🔐</text></svg>">
+    <style>
+        html {
+            font-size: 14px;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+        }
+    </style>
+</head>
+<body>
+<div id="error" hidden>
+    <button id="reset" onclick="signOut()">Reset</button>
+</div>
+<div id="not-signed-in" hidden>
+    <h1>Not Signed In</h1>
+    <p>Sign In With:</p>
+    <ul id="providers">
+        <li><a href="#" data-provider="local-test">CoAuth Test</a></li>
+        <li><a href="#" data-provider="local-dex">Dex</a></li>
+        <li><a href="#" data-provider="auth0">Auth0</a></li>
+        <li><a href="#" data-provider="azure">Azure</a></li>
+        <li><a href="#" data-provider="gitea">Gitea</a></li>
+        <li><a href="#" data-provider="gitlab">GitLab</a></li>
+        <li><a href="#" data-provider="okta">Okta</a></li>
+        <li><a href="#" data-provider="onelogin">OneLogin</a></li>
+    </ul>
+</div>
+<div id="signed-in" hidden>
+    <h1>Signed In</h1>
+    <pre id="id-token"></pre>
+    <button id="sign-out" onclick="signOut()">Sign Out</button>
+</div>
+<script>
+    const $ = document.querySelector.bind(document);
+    const pageUri = location.href.replace(/#.+/, '').replace(location.search, '');
+    const handleError = err => {
+        const el = document.createElement('pre');
+        el.textContent = `${err.message}\n\n${err.stack}`;
+        $('#error').prepend(el);
+        $('#error').removeAttribute('hidden');
+        throw err;
+    };
+    document.addEventListener('DOMContentLoaded', () => {
+        $('#providers').addEventListener('click', ev => {
+            ev.preventDefault();
+            if (ev.target.dataset.provider)
+                signIn(ev.target.dataset.provider).catch(handleError);
+        })
+        init().catch(handleError)
+    });
+    const asJSON = r =>
+        r.status >= 200 && r.status < 299
+            ? r.json()
+            : r.text().then(t => {
+                throw new Error(`server error: ${t}`)
+            });
+
+    // note that these won't work for you unless you have credentials to sign-in.
+    const providers = {
+        'local-test': {url: 'http://localhost:3211', clientID: 'http://localhost:8000'},
+        'local-dex': {url: 'https://oidc.lvh.me:5554', clientID: 'pkce-test-client'},
+        auth0: {url: 'https://dev-rcakyxrok2at0owx.us.auth0.com', clientID: 'LmzeuwsJxpHVcdhShFFxKU5Fk6ddWYqn'},
+        azure: {url: 'https://login.microsoftonline.com/f310f145-fb88-43c0-b3f1-5bb4bc794a06/v2.0', clientID: '3bff5ccf-1a47-44ea-8ced-a1a53a7672cc'},
+        gitea: {url: 'https://codeberg.org', clientID: 'f5ecf8e0-ee55-4c16-b712-7bafa345c2f4'},
+        gitlab: {url: 'https://gitlab.com', clientID: '97b46bfbbe20f4224321ed046cf3c4aca2dfabb1d6d714d48b1a5f4abcef239d'},
+        okta: {url: 'https://dev-97069488.okta.com', clientID: '0oag2n6eg50BE7PXe5d7'},
+        onelogin: {url: 'https://zipzip-dev.onelogin.com/oidc/2', clientID: '61800e90-ceea-013c-4897-125bb81d6d97228683'},
+    };
+
+    async function loadOpenIDConfig(provider) {
+        const config = providers[provider];
+        const openidConfig = await fetch(`${config.url}/.well-known/openid-configuration`).then(asJSON);
+        return {config: openidConfig, clientID: config.clientID};
+    }
+
+    async function init() {
+        const sp = new URLSearchParams(location.search || location.hash.replace(/^#(.+)/, '$1')),
+            code = sp.get('code'),
+            state = sp.get('state'),
+            provider = sessionStorage.getItem('provider');
+        if (provider && code && state === sessionStorage.getItem('state')) {
+            const {config: {token_endpoint, jwks_uri}, clientID} = await loadOpenIDConfig(provider);
+            const data = new FormData();
+            data.set('code', code);
+            data.set('client_id', clientID);
+            data.set('grant_type', 'authorization_code');
+            data.set('redirect_uri', pageUri);
+            data.set('code_verifier', sessionStorage.getItem('codeVerifier'));
+            sessionStorage.removeItem('provider');
+            sessionStorage.removeItem('state');
+            sessionStorage.removeItem('codeVerifier');
+            const {id_token, access_token, expiry} = await fetch(token_endpoint, {method: 'POST', body: new URLSearchParams(data)}).then(asJSON);
+            // `id_token` contains user claims specified by `scope` that was specified during sign-in
+            // `access_token` can be used to interact with the identity server until now+`expiry` seconds (typically used as a bearer token)
+            // this is where session management logic would begin
+            const idTokenContents = await verifyIDToken(jwks_uri, id_token);
+            $('#id-token').textContent = JSON.stringify(idTokenContents, null, 2);
+            $('#signed-in').removeAttribute('hidden');
+            history.pushState(null, '', pageUri);
+        } else {
+            $('#not-signed-in').removeAttribute('hidden');
+        }
+    }
+
+    const decodeB64 = s => {
+        switch (s.length % 4) {
+            case 2: s += '=='; break;
+            case 3: s += '='; break;
+        }
+        return atob(s.replace(/-/g, '+').replace(/_/g, '/'));
+    }
+    const encodeB64 = s => btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+
+    async function verifyIDToken(jwksURI, token) {
+        // this should be done server side
+        const keySet = new Map();
+        const {keys} = await fetch(jwksURI).then(asJSON);
+        const jwks = await Promise.all(keys.filter(k => {
+            const ok = k.kty === 'RSA' && k.use === 'sig';
+            if (!ok) { console.warn('skipping JWK type (only handling RSA keys)', key) }
+            return ok;
+        }).map(k => crypto.subtle.importKey('jwk', k, {
+            name: 'RSASSA-PKCS1-v1_5',
+            hash: 'SHA-256'
+        }, false, ['verify'])));
+        for (let i = 0; i < keys.length; i++) {
+            keySet.set(keys[i].kid, jwks[i]);
+        }
+
+        let [header64, content64, sig] = token.split('.');
+        const header = JSON.parse(atob(header64));
+        const key = keySet.get(header.kid);
+        if (!key)
+            throw new Error(`JWK with kid=${header.kid} not found`)
+
+        sig = decodeB64(sig);
+        const sigbin = new Uint8Array(sig.length);
+        for (let i = 0; i < sig.length; i++)
+            sigbin[i] = sig.charCodeAt(i);
+
+        if (!await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, sigbin, new TextEncoder().encode(header64 + '.' + content64)))
+            throw new Error('invalid id_token')
+
+        let contents = decodeB64(content64);
+        let contentsbin = new Uint8Array(contents.length);
+        for (let i = 0; i < contents.length; i++)
+            contentsbin[i] = contents.charCodeAt(i)
+        contents = decodeURIComponent(new TextDecoder('utf-8').decode(contentsbin))
+        return JSON.parse(contents)
+    }
+
+    async function signIn(provider) {
+        const {config: {authorization_endpoint}, clientID} = await loadOpenIDConfig(provider);
+        sessionStorage.setItem('provider', provider);
+        sessionStorage.setItem('state', crypto.randomUUID());
+        sessionStorage.setItem('codeVerifier', (crypto.randomUUID() + crypto.randomUUID()).replaceAll('-', ''));
+        const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(sessionStorage.getItem('codeVerifier')));
+        const qp = new URLSearchParams({
+            client_id: clientID,
+            redirect_uri: pageUri,
+            response_type: 'code',
+            response_mode: 'query', // or 'fragment' IIF the provider supports it
+            code_challenge_method: 'S256',
+            state: sessionStorage.getItem('state'),
+            scope: 'openid profile',
+            code_challenge: encodeB64(String.fromCharCode(...new Uint8Array(digest))),
+        });
+        location.replace(`${authorization_endpoint}?${qp}`);
+    }
+
+    function signOut() {
+        location.replace(pageUri);
+    }
+</script>
+</body>
+</html>
